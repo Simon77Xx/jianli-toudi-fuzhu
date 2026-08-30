@@ -15,7 +15,8 @@
   - 增加 ZIP 解压总大小、单文件大小和 PDF 文件大小限制，降低压缩炸弹与超大输入风险。
   - UI 冒烟脚本改为适配 Gradio 长连接的 `DOMContentLoaded` 等待，并验证文件上传控件、JD 输入、开始按钮和 GitHub 默认关闭状态。
   - 将前端上传区可见提示固定为中文并关闭 Gradio 默认页脚链接，避免浏览器 locale 影响使用体验；截图已确认“将文件拖放到这里 / 或 / 点击上传”。
-  - 补充 ZIP 大小边界、Windows 反斜杠路径和模型输出门禁单元测试；当前共 9 个单元测试全部通过。
+  - 补充 ZIP 大小边界、Windows 反斜杠路径和模型输出门禁单元测试；当前共 11 个单元测试全部通过。
+  - 修复双语 LaTeX ZIP 无法识别主文件的问题：对并行入口进行中文优先评分，并为仍有歧义的情况保留明确错误提示。
   - XeLaTeX 冒烟编译成功，生成 1 页 PDF；浏览器截图写入 `output/playwright/landing.png`。
 - Files created/modified:
   - `task_plan.md`
@@ -30,7 +31,7 @@
 | Test | Input | Expected | Actual | Status |
 |------|-------|----------|--------|--------|
 | `python -m compileall -q app.py resume_agent tests` | Python 源码 | 无语法错误 | 通过 | ✅ |
-| `python -m unittest discover -s tests -v` | 9 个离线单元测试 | 全部通过 | 9/9 通过 | ✅ |
+| `python -m unittest discover -s tests -v` | 11 个离线单元测试 | 全部通过 | 11/11 通过 | ✅ |
 | `python C:\\Users\\xiejiaxu\\.codex\\skills\\webapp-testing\\scripts\\with_server.py --server "python tests/serve_for_test.py" --port 7863 -- python tests/ui_smoke.py` | 本地 Gradio | 页面可访问且关键控件存在 | 通过，截图已生成 | ✅ |
 | XeLaTeX 冒烟编译 | `runtime/compile-smoke-elevated-fixed/main.tex` | 生成可读 PDF 且页数可读 | 1 页，成功 | ✅ |
 

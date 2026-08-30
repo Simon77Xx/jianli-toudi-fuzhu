@@ -89,6 +89,25 @@ class ExtractorTests(unittest.TestCase):
             (root / "fragment.tex").write_text("hello", encoding="utf-8")
             self.assertEqual(find_main_tex(root).name, "main.tex")
 
+    def test_prefers_chinese_entrypoint_when_parallel_versions_exist(self):
+        with workspace_tempdir() as temp:
+            root = Path(temp)
+            template = "\\documentclass{resume}\n\\begin{document}x\\end{document}"
+            (root / "resume-en.tex").write_text(template, encoding="utf-8")
+            (root / "resume-zh.tex").write_text(
+                "\\documentclass[zh]{resume}\n\\begin{document}x\\end{document}", encoding="utf-8"
+            )
+            self.assertEqual(find_main_tex(root).name, "resume-zh.tex")
+
+    def test_rejects_equally_ambiguous_main_tex_candidates(self):
+        with workspace_tempdir() as temp:
+            root = Path(temp)
+            template = "\\documentclass{resume}\n\\begin{document}x\\end{document}"
+            (root / "first.tex").write_text(template, encoding="utf-8")
+            (root / "second.tex").write_text(template, encoding="utf-8")
+            with self.assertRaises(InputError):
+                find_main_tex(root)
+
 
 class LatexSafetyTests(unittest.TestCase):
     def test_reorders_sections(self):

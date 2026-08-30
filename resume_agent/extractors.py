@@ -72,10 +72,39 @@ def find_main_tex(project_dir: Path) -> Path:
         text = path.read_text(encoding="utf-8", errors="ignore")
         if "\\documentclass" in text and "\\begin{document}" in text:
             candidates.append(path)
-    if len(candidates) != 1:
+    if len(candidates) == 1:
+        return candidates[0]
+    if len(candidates) > 1:
+        # Resume templates commonly ship parallel English/Chinese entrypoints.
+        # Prefer an explicit Chinese entrypoint because this app is Chinese-first.
+        scored = sorted(
+            ((_main_tex_score(path), path) for path in candidates),
+            key=lambda item: (-item[0], str(item[1]).lower()),
+        )
+        if scored[0][0] > scored[1][0] and scored[0][0] > 0:
+            return scored[0][1]
         names = "、".join(path.name for path in candidates or tex_files)
-        raise InputError(f"无法唯一识别 LaTeX 主文件（候选：{names}）。请保证 ZIP 中只有一个含 documentclass 的主文件。")
-    return candidates[0]
+        raise InputError(
+            f"无法唯一识别 LaTeX 主文件（候选：{names}）。"
+            "请将中文入口命名为包含 zh/cn/chinese 的文件，或删除不使用的入口后重新压缩。"
+        )
+    raise InputError("ZIP 中的 .tex 文件都不是完整主文件（缺少 documentclass 或 begin{document}）。")
+
+
+def _main_tex_score(path: Path) -> int:
+    """Return a conservative preference score for parallel resume entrypoints."""
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    stem = path.stem.lower()
+    score = 0
+    if re.search(r"(?:^|[-_.])(zh|cn|chinese)(?:$|[-_.])", stem):
+        score += 100
+    if re.search(r"\\documentclass\s*\[\s*(?:zh|cn|chinese)(?:[,\]])", text, re.I):
+        score += 100
+    if stem in {"main", "resume", "cv"}:
+        score += 10
+    if re.search(r"(?:^|[-_.])(en|english)(?:$|[-_.])", stem):
+        score -= 10
+    return score
 
 
 def extract_pdf_text(pdf_path: str | Path) -> str:

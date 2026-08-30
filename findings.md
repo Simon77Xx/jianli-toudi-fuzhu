@@ -35,6 +35,7 @@
 | ZIP 仅限制压缩包大小不足以防压缩炸弹 | 增加单文件 100MB、解压总量 250MB 限制；PDF 限制 25MB。 |
 | Windows 反斜杠路径可能绕过 POSIX ZIP 路径检查 | 统一转换 `/` 并拒绝 `..`、盘符和 UNC 路径；增加 Windows 路径回归测试。 |
 | Gradio 文件组件跟随浏览器语言显示日文 | 通过上传控件专用 CSS 伪元素覆盖可见提示并关闭默认页脚链接，保留原生上传交互；浏览器截图确认中文显示。 |
+| LaTeX 模板同时包含 `resume-en.tex` 与 `resume-zh.tex` | 主文件检测增加保守评分：优先文件名或 `documentclass` 标记为 `zh`、`cn`、`chinese` 的入口；无法形成明确优势时仍报错，避免误编译。 |
 
 ## Resources
 
