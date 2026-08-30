@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+runtime/
+output/
+data/confirmed_facts.json
+data/feedback.json
+*.pdf
+*.aux
+*.log
+*.out
+*.synctex.gz
+
+谢家旭的简历.pdf
