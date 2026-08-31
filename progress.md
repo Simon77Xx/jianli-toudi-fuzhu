@@ -17,6 +17,7 @@
   - 将前端上传区可见提示固定为中文并关闭 Gradio 默认页脚链接，避免浏览器 locale 影响使用体验；截图已确认“将文件拖放到这里 / 或 / 点击上传”。
   - 补充 ZIP 大小边界、Windows 反斜杠路径和模型输出门禁单元测试；当前共 11 个单元测试全部通过。
   - 修复双语 LaTeX ZIP 无法识别主文件的问题：对并行入口进行中文优先评分，并为仍有歧义的情况保留明确错误提示。
+  - 增加独立修改前基线评分，前端和 `report.md` 并列展示修改前、修改后及变化值，帮助判断定制是否真正提升投递质量。
   - XeLaTeX 冒烟编译成功，生成 1 页 PDF；浏览器截图写入 `output/playwright/landing.png`。
 - Files created/modified:
   - `task_plan.md`
@@ -31,7 +32,7 @@
 | Test | Input | Expected | Actual | Status |
 |------|-------|----------|--------|--------|
 | `python -m compileall -q app.py resume_agent tests` | Python 源码 | 无语法错误 | 通过 | ✅ |
-| `python -m unittest discover -s tests -v` | 11 个离线单元测试 | 全部通过 | 11/11 通过 | ✅ |
+| `python -m unittest discover -s tests -v` | 14 个离线单元测试 | 全部通过 | 14/14 通过 | ✅ |
 | `python C:\\Users\\xiejiaxu\\.codex\\skills\\webapp-testing\\scripts\\with_server.py --server "python tests/serve_for_test.py" --port 7863 -- python tests/ui_smoke.py` | 本地 Gradio | 页面可访问且关键控件存在 | 通过，截图已生成 | ✅ |
 | XeLaTeX 冒烟编译 | `runtime/compile-smoke-elevated-fixed/main.tex` | 生成可读 PDF 且页数可读 | 1 页，成功 | ✅ |
 

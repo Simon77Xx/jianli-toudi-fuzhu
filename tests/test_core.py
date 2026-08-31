@@ -11,7 +11,7 @@ from unittest.mock import patch
 from resume_agent.extractors import InputError, find_main_tex, safe_extract_zip
 from resume_agent.latex import apply_evidence_bound_edits, reorder_sections
 from resume_agent.llm import _extract_json
-from resume_agent.models import DefenseRecord, Evidence, FinalAnalysis, JobContext, TexEdit
+from resume_agent.models import BaselineAnalysis, CompileResult, DefenseRecord, Evidence, FinalAnalysis, JobContext, TexEdit, format_score_delta
 from resume_agent.pipeline import ResumePipeline
 
 
@@ -162,6 +162,54 @@ class LatexSafetyTests(unittest.TestCase):
         self.assertEqual(guarded.tailored_summary, "")
         self.assertFalse(guarded.defense_records)
         self.assertEqual(len(warnings), 2)
+
+
+class ScoreComparisonTests(unittest.TestCase):
+    def test_baseline_score_range_is_validated(self):
+        baseline = BaselineAnalysis(
+            delivery_score=73,
+            competitiveness_score=38,
+            delivery_reasons=["原始简历可读"],
+            competitiveness_reasons=["缺少核心数据链路证据"],
+        )
+        self.assertEqual(baseline.delivery_score, 73)
+        with self.assertRaises(ValueError):
+            BaselineAnalysis(
+                delivery_score=101,
+                competitiveness_score=38,
+                delivery_reasons=[],
+                competitiveness_reasons=[],
+            )
+
+    def test_score_delta_is_after_minus_before(self):
+        self.assertEqual(format_score_delta(73, 86), "+13")
+        self.assertEqual(format_score_delta(86, 73), "-13")
+        self.assertEqual(format_score_delta(73, 73), "0")
+
+    def test_report_contains_before_after_scores_and_delta(self):
+        context = JobContext(
+            session_id="s",
+            work_dir="runtime/test-tmp/s",
+            project_dir="runtime/test-tmp/s",
+            tex_path="runtime/test-tmp/s/main.tex",
+            pdf_path="runtime/test-tmp/s/resume.pdf",
+            jd_text="JD",
+            tex_text="简历",
+            pdf_text="",
+            evidence=[],
+        )
+        baseline = BaselineAnalysis(
+            delivery_score=73,
+            competitiveness_score=38,
+            delivery_reasons=["修改前理由"],
+            competitiveness_reasons=["修改前缺口"],
+        )
+        analysis = analysis_fixture(delivery_score=86, competitiveness_score=52)
+        compiled = CompileResult(success=True, page_count=1)
+        report = ResumePipeline()._render_report(context, baseline, compiled, analysis, compiled, [], [], [])
+        self.assertIn("| 投递准备度 | 73/100 | 86/100 | +13 |", report)
+        self.assertIn("| 岗位竞争匹配度 | 38/100 | 52/100 | +14 |", report)
+        self.assertIn("修改前缺口", report)
 
 
 class LLMParsingTests(unittest.TestCase):

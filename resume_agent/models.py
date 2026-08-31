@@ -49,6 +49,15 @@ class DefenseRecord(BaseModel):
     truthful_answer_outline: str
 
 
+class BaselineAnalysis(BaseModel):
+    """独立评估原始简历的两项投递分数。"""
+
+    delivery_score: int = Field(ge=0, le=100)
+    competitiveness_score: int = Field(ge=0, le=100)
+    delivery_reasons: list[str]
+    competitiveness_reasons: list[str]
+
+
 class FinalAnalysis(BaseModel):
     hr_summary: str
     delivery_score: int = Field(ge=0, le=100)
@@ -93,3 +102,10 @@ class JobContext(BaseModel):
     def root(self) -> Path:
         return Path(self.work_dir)
 
+
+def format_score_delta(before: int, after: int) -> str:
+    """Format an after-minus-before score change for UI and Markdown output."""
+    delta = after - before
+    if delta > 0:
+        return f"+{delta}"
+    return str(delta)

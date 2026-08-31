@@ -8,6 +8,7 @@ import gradio as gr
 
 from resume_agent.config import ROOT
 from resume_agent.llm import ModelServiceError
+from resume_agent.models import format_score_delta
 from resume_agent.pipeline import PipelineError, ResumePipeline
 from resume_agent.storage import ensure_feedback_placeholder
 
@@ -77,6 +78,8 @@ def _question_text(question) -> str:
 
 
 def _render_result(result: dict) -> tuple[str, str]:
+    baseline = result["baseline"]
+    baseline_compile = result["baseline_compile"]
     analysis = result["analysis"]
     compile_result = result["compile"]
     if analysis.competitiveness_score < 50:
@@ -94,8 +97,15 @@ def _render_result(result: dict) -> tuple[str, str]:
         + f"<p><b>真实回答提纲：</b>{html.escape(record.truthful_answer_outline)}</p></details>"
         for record in analysis.defense_records
     ) or "暂无需要展开的强化 bullet。"
-    markdown = f"""<div class=\"score-card\">
-<h2>投递决策</h2>
+    markdown = f"""## 修改前后评分对比
+
+| 指标 | 修改前 | 修改后 | 变化值 |
+| --- | ---: | ---: | ---: |
+| 投递准备度 | {baseline.delivery_score}/100 | {analysis.delivery_score}/100 | {format_score_delta(baseline.delivery_score, analysis.delivery_score)} |
+| 岗位竞争匹配度 | {baseline.competitiveness_score}/100 | {analysis.competitiveness_score}/100 | {format_score_delta(baseline.competitiveness_score, analysis.competitiveness_score)} |
+
+<div class=\"score-card\">
+<h2>修改后投递决策</h2>
 <p><b>投递准备度：{analysis.delivery_score}/100</b>　{('可投递' if analysis.delivery_score >= 90 else '尚需修正')}</p>
 <p><b>岗位竞争匹配度：{analysis.competitiveness_score}/100</b>　{recommendation}</p>
 </div>
@@ -104,10 +114,16 @@ def _render_result(result: dict) -> tuple[str, str]:
 {analysis.hr_summary}
 
 ## 评分理由
-**投递准备度**
+**修改前投递准备度**
+{''.join(f'- {item}\n' for item in baseline.delivery_reasons)}
+
+**修改后投递准备度**
 {''.join(f'- {item}\n' for item in analysis.delivery_reasons)}
 
-**岗位竞争匹配度**
+**修改前岗位竞争匹配度**
+{''.join(f'- {item}\n' for item in baseline.competitiveness_reasons)}
+
+**修改后岗位竞争匹配度**
 {''.join(f'- {item}\n' for item in analysis.competitiveness_reasons)}
 
 ## 修改前后差异
@@ -129,6 +145,11 @@ def _render_result(result: dict) -> tuple[str, str]:
     else:
         warnings.append("本地 XeLaTeX 编译失败；请先修复再投递。")
         warnings.append(f"日志摘要：{compile_result.log_excerpt[-1200:]}")
+    if baseline_compile.success:
+        warnings.append(f"修改前原始 LaTeX 编译成功：{baseline_compile.page_count} 页。")
+    else:
+        warnings.append("修改前原始 LaTeX 编译失败；修改前投递准备度已按同等质量规则限制。")
+        warnings.append(f"修改前编译日志摘要：{baseline_compile.log_excerpt[-1200:]}")
     warnings.extend(compile_result.compression_actions)
     warning_md = "### 质检与提示\n\n" + "\n".join(f"- {item}" for item in warnings)
     return markdown, warning_md
