@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import unittest
 import uuid
 import zipfile
@@ -8,11 +9,35 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from resume_agent.extractors import InputError, find_main_tex, safe_extract_zip
-from resume_agent.latex import apply_evidence_bound_edits, reorder_sections
-from resume_agent.llm import _extract_json
-from resume_agent.models import BaselineAnalysis, CompileResult, DefenseRecord, Evidence, FinalAnalysis, JobContext, TexEdit, format_score_delta
-from resume_agent.pipeline import ResumePipeline
+import app as web_app
+from resume_agent.config import Settings
+from resume_agent.extractors import (
+    InputError,
+    evidence_from_materials,
+    find_main_tex,
+    github_repositories,
+    safe_extract_zip,
+)
+from resume_agent.latex import (
+    _remove_section,
+    apply_evidence_bound_edits,
+    reorder_sections,
+    replace_summary_and_keywords,
+)
+from resume_agent.llm import LLMGateway, ModelServiceError, _extract_json
+from resume_agent.models import (
+    BaselineAnalysis,
+    CompileResult,
+    DefenseRecord,
+    Evidence,
+    FinalAnalysis,
+    InitialAnalysis,
+    JobContext,
+    Question,
+    TexEdit,
+    format_score_delta,
+)
+from resume_agent.pipeline import PipelineError, ResumePipeline
 
 
 def analysis_fixture(**changes) -> FinalAnalysis:
@@ -40,10 +65,13 @@ def workspace_tempdir():
     root = Path("runtime") / "test-tmp"
     root.mkdir(parents=True, exist_ok=True)
     # Windows sandbox 下 tempfile 会对临时目录设置与当前令牌不兼容的 ACL；
-    # 使用项目内、已忽略的唯一目录，测试结束后不影响用户材料。
+    # 使用项目内、已忽略的唯一目录，并在测试结束后自动清理。
     path = root / f"case-{uuid.uuid4().hex}"
     path.mkdir()
-    yield str(path)
+    try:
+        yield str(path)
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 class ExtractorTests(unittest.TestCase):
@@ -108,6 +136,46 @@ class ExtractorTests(unittest.TestCase):
             with self.assertRaises(InputError):
                 find_main_tex(root)
 
+    def test_github_repositories_preserves_trailing_git_chars_and_strips_dot_git(self):
+        tex = (
+            r"\link{https://github.com/alice/my-agent}{a} "
+            r"\link{https://github.com/bob/ai-chat.git}{b} "
+            r"\link{https://github.com/carol/llm-kit}{c}"
+        )
+        self.assertEqual(
+            github_repositories(tex),
+            [("alice", "my-agent"), ("bob", "ai-chat"), ("carol", "llm-kit")],
+        )
+
+    def test_evidence_from_materials_extracts_multiline_blocks(self):
+        tex = """\\documentclass[zh]{resume}
+\\begin{document}
+\\begin{abstract}
+计算机本科在读，
+专注多模态与智能体工程。
+\\end{abstract}
+\\begin{educations}
+  \\education%
+    {2028.09}%
+    [2024.09]%
+    {重庆大学}%
+    {数据科学与大数据技术}
+\\end{educations}
+\\begin{itemize}
+  \\item \\textbf{OCR智能体}
+  采用 Qwen2.5 + Qwen3，正确率 75\\%。
+  \\item \\textbf{项目A} 内容A \\item \\textbf{项目B} 内容B
+\\end{itemize}
+\\end{document}
+"""
+        items = evidence_from_materials(tex, "", [])
+        claims = [item.claim for item in items]
+        self.assertTrue(any("专注多模态与智能体工程" in c for c in claims))
+        self.assertTrue(any("重庆大学" in c and "数据科学与大数据技术" in c for c in claims))
+        self.assertTrue(any("OCR智能体" in c and "75\\%" in c for c in claims))
+        self.assertTrue(any("项目A" in c and "项目B" not in c for c in claims))
+        self.assertTrue(any("项目B" in c for c in claims))
+
 
 class LatexSafetyTests(unittest.TestCase):
     def test_reorders_sections(self):
@@ -115,6 +183,40 @@ class LatexSafetyTests(unittest.TestCase):
         updated, actions = reorder_sections(original, ["个人项目", "教育背景"])
         self.assertLess(updated.index("个人项目"), updated.index("教育背景"))
         self.assertTrue(actions)
+
+    def test_reorders_and_removes_last_section_without_breaking_end_document(self):
+        original = (
+            "\\begin{document}\n"
+            "\\sectionTitle{教育背景}{a}\n教育内容\n"
+            "\\sectionTitle{个人优势}{b}\n优势内容\n"
+            "\\end{document}\n"
+        )
+        reordered, actions = reorder_sections(original, ["个人优势", "教育背景"])
+        self.assertTrue(actions)
+        self.assertLess(reordered.index("个人优势"), reordered.index("教育背景"))
+        self.assertTrue(reordered.strip().endswith("\\end{document}"))
+        self.assertLess(reordered.index("教育内容"), reordered.index("\\end{document}"))
+
+        removed_tex, removed = _remove_section(original, "个人优势")
+        self.assertTrue(removed)
+        self.assertNotIn("优势内容", removed_tex)
+        self.assertIn("\\end{document}", removed_tex)
+
+    def test_replace_summary_and_keywords_escapes_special_chars_safely(self):
+        tex = "\\keywords{old}\n\\begin{abstract}\n旧摘要\n\\end{abstract}\n"
+        analysis = analysis_fixture(
+            keywords=["C/C++ & Python", "C#\\Agent_v2", "100% 真实"],
+            tailored_summary="提升 15% 且覆盖 A&B_test #1，已转义 70\\% 保持不变。",
+        )
+        updated, actions = replace_summary_and_keywords(tex, analysis)
+        self.assertEqual(len(actions), 2)
+        self.assertIn(r"C/C++ \& Python", updated)
+        self.assertIn(r"C\#\Agent\_v2", updated)
+        self.assertIn(r"100\% 真实", updated)
+        self.assertIn(r"15\%", updated)
+        self.assertIn(r"A\&B\_test \#1", updated)
+        self.assertIn(r"70\%", updated)
+        self.assertNotIn(r"70\\%", updated)
 
     def test_rejects_new_numbers_in_edit(self):
         analysis = analysis_fixture(
@@ -124,6 +226,24 @@ class LatexSafetyTests(unittest.TestCase):
         self.assertEqual(updated, "性能提升 10%")
         self.assertFalse(actions)
         self.assertTrue(rejected)
+
+    def test_allows_numbers_from_cited_confirmed_fact_and_rejects_empty_evidence_or_bad_braces(self):
+        analysis = analysis_fixture(
+            edits=[
+                TexEdit(source="完成数据清洗", target="完成数据清洗，过滤率达 35\\%", reason="补充真实指标", evidence_ids=["F1"]),
+                TexEdit(source="旧文本", target="新文本", reason="漏证据", evidence_ids=[]),
+                TexEdit(source="\\textbf{旧}", target="\\textbf{新", reason="坏括号", evidence_ids=["R1"]),
+            ]
+        )
+        updated, actions, rejected = apply_evidence_bound_edits(
+            "完成数据清洗\n旧文本\n\\textbf{旧}",
+            analysis,
+            {"R1", "F1"},
+            evidence_by_id={"R1": "旧", "F1": "已确认过滤率达 35%"},
+        )
+        self.assertIn("过滤率达 35\\%", updated)
+        self.assertEqual(actions, ["补充真实指标"])
+        self.assertEqual(len(rejected), 2)
 
     def test_accepts_evidence_bound_edit(self):
         analysis = analysis_fixture(
@@ -144,7 +264,14 @@ class LatexSafetyTests(unittest.TestCase):
                     rewrite_reason="测试",
                     possible_question="怎么做的？",
                     truthful_answer_outline="据实回答",
-                )
+                ),
+                DefenseRecord(
+                    rewritten_text="缺少证据改写",
+                    source_evidence_ids=[],
+                    rewrite_reason="测试",
+                    possible_question="怎么做的？",
+                    truthful_answer_outline="据实回答",
+                ),
             ],
         )
         context = JobContext(
@@ -156,12 +283,13 @@ class LatexSafetyTests(unittest.TestCase):
             jd_text="JD",
             tex_text="\n性能提升 10%\n",
             pdf_text="",
-            evidence=[Evidence(id="R1", source="latex", claim="性能提升 10%", location="main.tex")],
+            evidence=[Evidence(id="R1", source="latex", claim="性能提升 10%", location="LaTeX 第 99 行")],
         )
         guarded, warnings = ResumePipeline._apply_model_guards(context, analysis)
+        # 行号 99 不应泄露进数字白名单，因此 99% 摘要仍应被拦截。
         self.assertEqual(guarded.tailored_summary, "")
         self.assertFalse(guarded.defense_records)
-        self.assertEqual(len(warnings), 2)
+        self.assertEqual(len(warnings), 3)
 
 
 class ScoreComparisonTests(unittest.TestCase):
@@ -211,10 +339,118 @@ class ScoreComparisonTests(unittest.TestCase):
         self.assertIn("| 岗位竞争匹配度 | 38/100 | 52/100 | +14 |", report)
         self.assertIn("修改前缺口", report)
 
+    def test_report_includes_compile_failure_log_excerpt(self):
+        context = JobContext(
+            session_id="s",
+            work_dir="runtime/test-tmp/s",
+            project_dir="runtime/test-tmp/s",
+            tex_path="runtime/test-tmp/s/main.tex",
+            pdf_path="runtime/test-tmp/s/resume.pdf",
+            jd_text="JD",
+            tex_text="简历",
+            pdf_text="",
+            evidence=[],
+        )
+        baseline = BaselineAnalysis(
+            delivery_score=70,
+            competitiveness_score=60,
+            delivery_reasons=["r"],
+            competitiveness_reasons=["c"],
+        )
+        analysis = analysis_fixture(delivery_score=75, competitiveness_score=65)
+        failed = CompileResult(success=False, log_excerpt="诊断：本机未安装模板字体（IBM Plex Serif）。")
+        report = ResumePipeline()._render_report(context, baseline, failed, analysis, failed, [], [], [])
+        self.assertIn("本机未安装模板字体（IBM Plex Serif）", report)
+
 
 class LLMParsingTests(unittest.TestCase):
     def test_extracts_json_from_fence(self):
         self.assertEqual(_extract_json("```json\n{\"ok\": true}\n```"), '{"ok": true}')
+
+    def test_extracts_json_with_surrounding_latex_braces_and_repairs_escapes(self):
+        raw = r'说明：参考 \textbf{Python}。结果如下：{"source": "\item 正确率 75\%", "ok": true} 完毕 \section{End}'
+        extracted = _extract_json(raw)
+        self.assertIn('"ok": true', extracted)
+        self.assertIn(r'\\item', extracted)
+
+    def test_initial_analysis_caps_more_than_five_questions(self):
+        questions = [
+            Question(id=f"Q{i}", question=f"问题{i}", why="理由", related_requirement="要求")
+            for i in range(1, 8)
+        ]
+        initial = InitialAnalysis(quick_assessment="ok", requirements=[], questions=questions)
+        self.assertEqual(len(initial.questions), 5)
+
+    def test_llm_gateway_retries_on_bad_json_then_succeeds(self):
+        settings = Settings(
+            protocol="openai",
+            api_key="test-key",
+            base_url=None,
+            model="test-model",
+            max_input_chars=180000,
+            xelatex_path="",
+        )
+        gateway = LLMGateway(settings=settings, max_attempts=2)
+        responses = [
+            "not valid json at all",
+            '{"delivery_score": 80, "competitiveness_score": 65, "delivery_reasons": ["ok"], "competitiveness_reasons": ["ok"]}',
+        ]
+        with patch.object(gateway, "_call", side_effect=responses) as mock_call:
+            result = gateway.structured("sys", "user", BaselineAnalysis)
+        self.assertEqual(result.delivery_score, 80)
+        self.assertEqual(mock_call.call_count, 2)
+
+
+class AppCallbackTests(unittest.TestCase):
+    def test_submit_answer_clears_textbox_and_keeps_question_on_validation_error(self):
+        q2 = Question(id="Q2", question="第二个问题", why="影响判断", related_requirement="PyTorch")
+        ctx = JobContext(
+            session_id="abc123",
+            work_dir="runtime/test-tmp/abc123",
+            project_dir="runtime/test-tmp/abc123",
+            tex_path="runtime/test-tmp/abc123/main.tex",
+            pdf_path="runtime/test-tmp/abc123/resume.pdf",
+            jd_text="JD",
+            tex_text="tex",
+            pdf_text="pdf",
+            evidence=[],
+            current_question_index=1,
+        )
+        with patch.object(web_app.pipeline, "answer", return_value=(ctx, q2)):
+            out = web_app.submit_answer("abc123", "第一题回答")
+        # answer_text (index 3) 必须被清空，retry_button (index 4) 隐藏
+        self.assertEqual(out[3]["value"], "")
+        self.assertFalse(out[4]["visible"])
+
+        with patch.object(web_app.pipeline, "answer", side_effect=PipelineError("请填写真实回答")):
+            err_out = web_app.submit_answer("abc123", "")
+        # 出错时不清空当前题目（返回 gr.update() 无 value 键）
+        self.assertNotIn("value", err_out[1])
+        self.assertTrue(err_out[2]["visible"])
+
+    def test_finalize_failure_exposes_retry_button(self):
+        ctx = JobContext(
+            session_id="abc123",
+            work_dir="runtime/test-tmp/abc123",
+            project_dir="runtime/test-tmp/abc123",
+            tex_path="runtime/test-tmp/abc123/main.tex",
+            pdf_path="runtime/test-tmp/abc123/resume.pdf",
+            jd_text="JD",
+            tex_text="tex",
+            pdf_text="pdf",
+            evidence=[],
+            current_question_index=1,
+        )
+        with (
+            patch.object(web_app.pipeline, "answer", return_value=(ctx, None)),
+            patch.object(web_app.pipeline, "finalize", side_effect=ModelServiceError("模型限流")),
+        ):
+            out = web_app.submit_answer("abc123", "最后一题回答")
+        self.assertEqual(out[0], "abc123")
+        self.assertFalse(out[2]["visible"])  # question_group 隐藏
+        self.assertEqual(out[3]["value"], "")  # answer_text 已清空
+        self.assertTrue(out[4]["visible"])  # retry_button 可见
+        self.assertIn("重试生成投递包", out[5])
 
 
 if __name__ == "__main__":

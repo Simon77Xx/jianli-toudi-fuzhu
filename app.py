@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import os
 from pathlib import Path
 
@@ -8,15 +9,21 @@ import gradio as gr
 
 from resume_agent.config import ROOT
 from resume_agent.llm import ModelServiceError
-from resume_agent.models import format_score_delta
+from resume_agent.models import format_score_delta, recommendation_label
 from resume_agent.pipeline import PipelineError, ResumePipeline
 from resume_agent.storage import ensure_feedback_placeholder
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("resume_agent.app")
+
 pipeline = ResumePipeline()
 
 
-CSS = """
+CSS = r"""
 :root {
   --ink: #102a43;
   --muted: #627d98;
@@ -82,14 +89,7 @@ def _render_result(result: dict) -> tuple[str, str]:
     baseline_compile = result["baseline_compile"]
     analysis = result["analysis"]
     compile_result = result["compile"]
-    if analysis.competitiveness_score < 50:
-        recommendation = "低优先级/不建议投递"
-    elif analysis.competitiveness_score < 70:
-        recommendation = "可尝试"
-    elif analysis.competitiveness_score < 85:
-        recommendation = "较匹配"
-    else:
-        recommendation = "强匹配"
+    recommendation = recommendation_label(analysis.competitiveness_score)
     defense = "".join(
         "<details><summary>" + html.escape(record.rewritten_text[:90]) + "</summary>"
         + f"<p><b>证据：</b>{html.escape(', '.join(record.source_evidence_ids))}</p>"
@@ -167,33 +167,134 @@ def _result_outputs(result: dict):
     return result_md, warning_md, report, archive, pdf
 
 
+def retry_finalize(session_id: str, success_msg: str = "投递包已重新生成。"):
+    try:
+        result = pipeline.finalize(session_id)
+        result_md, warning_md, report, archive, pdf = _result_outputs(result)
+        return (
+            session_id,
+            "",
+            gr.update(visible=False),
+            gr.update(value=""),
+            gr.update(visible=False),
+            success_msg,
+            result_md,
+            warning_md,
+            report,
+            archive,
+            pdf,
+        )
+    except (PipelineError, ModelServiceError) as exc:
+        return (
+            session_id,
+            "",
+            gr.update(visible=False),
+            gr.update(value=""),
+            gr.update(visible=bool(session_id)),
+            f"### 生成投递包失败\n\n{exc}\n\n已保存你的全部确认回答，可点击下方“重试生成投递包”直接重试。",
+            "",
+            "",
+            *_empty_downloads(),
+        )
+    except Exception as exc:  # avoid exposing API key / local paths in the UI
+        logger.exception("Unexpected error during pipeline.finalize for session=%s", session_id)
+        return (
+            session_id,
+            "",
+            gr.update(visible=False),
+            gr.update(value=""),
+            gr.update(visible=bool(session_id)),
+            f"### 本地处理出错\n\n{exc.__class__.__name__}。已保存你的全部确认回答，请查看终端日志后点击“重试生成投递包”。",
+            "",
+            "",
+            *_empty_downloads(),
+        )
+
+
 def start_analysis(latex_zip, resume_pdf, jd_text, github_enabled):
     try:
-        context, question, notes = pipeline.start(latex_zip, resume_pdf, jd_text, github_enabled)
-        base = [context.session_id, "", gr.update(visible=False), "材料解析完成。", "", ""]
-        if question:
-            return (*base[:1], _question_text(question), gr.update(visible=True), "已完成匹配分析，请确认第 1 个事实。", "", "", *_empty_downloads())
-        result = pipeline.finalize(context.session_id)
-        result_md, warning_md, report, archive, pdf = _result_outputs(result)
-        return (context.session_id, "", gr.update(visible=False), "分析与投递包已生成。", result_md, warning_md, report, archive, pdf)
+        context, question, _notes = pipeline.start(latex_zip, resume_pdf, jd_text, github_enabled)
     except (PipelineError, ModelServiceError) as exc:
-        return ("", "", gr.update(visible=False), f"### 无法继续\n\n{exc}", "", "", *_empty_downloads())
+        return (
+            "",
+            "",
+            gr.update(visible=False),
+            gr.update(value=""),
+            gr.update(visible=False),
+            f"### 无法继续\n\n{exc}",
+            "",
+            "",
+            *_empty_downloads(),
+        )
     except Exception as exc:  # avoid exposing API key / local paths in the UI
-        return ("", "", gr.update(visible=False), f"### 本地处理出错\n\n{exc.__class__.__name__}。请查看终端日志后重试。", "", "", *_empty_downloads())
+        logger.exception("Unexpected error during pipeline.start")
+        return (
+            "",
+            "",
+            gr.update(visible=False),
+            gr.update(value=""),
+            gr.update(visible=False),
+            f"### 本地处理出错\n\n{exc.__class__.__name__}。请查看终端日志后重试。",
+            "",
+            "",
+            *_empty_downloads(),
+        )
+    if question:
+        return (
+            context.session_id,
+            _question_text(question),
+            gr.update(visible=True),
+            gr.update(value=""),
+            gr.update(visible=False),
+            "已完成匹配分析，请确认第 1 个事实。",
+            "",
+            "",
+            *_empty_downloads(),
+        )
+    return retry_finalize(context.session_id, success_msg="分析与投递包已生成。")
 
 
 def submit_answer(session_id, answer):
     try:
         context, question = pipeline.answer(session_id, answer)
-        if question:
-            return (context.session_id, _question_text(question), gr.update(visible=True), f"已保存回答。请继续第 {context.current_question_index + 1} 个问题。", "", "", *_empty_downloads())
-        result = pipeline.finalize(context.session_id)
-        result_md, warning_md, report, archive, pdf = _result_outputs(result)
-        return (context.session_id, "", gr.update(visible=False), "已保存全部确认事实并生成投递包。", result_md, warning_md, report, archive, pdf)
     except (PipelineError, ModelServiceError) as exc:
-        return (session_id, "", gr.update(visible=True), f"### 无法继续\n\n{exc}", "", "", *_empty_downloads())
+        return (
+            session_id,
+            gr.update(),
+            gr.update(visible=True),
+            gr.update(),
+            gr.update(visible=False),
+            f"### 无法继续\n\n{exc}",
+            "",
+            "",
+            *_empty_downloads(),
+        )
     except Exception as exc:
-        return (session_id, "", gr.update(visible=True), f"### 本地处理出错\n\n{exc.__class__.__name__}。请查看终端日志后重试。", "", "", *_empty_downloads())
+        logger.exception("Unexpected error during pipeline.answer for session=%s", session_id)
+        return (
+            session_id,
+            gr.update(),
+            gr.update(visible=True),
+            gr.update(),
+            gr.update(visible=False),
+            f"### 本地处理出错\n\n{exc.__class__.__name__}。请查看终端日志后重试。",
+            "",
+            "",
+            *_empty_downloads(),
+        )
+    if question:
+        return (
+            context.session_id,
+            _question_text(question),
+            gr.update(visible=True),
+            gr.update(value=""),
+            gr.update(visible=False),
+            f"已保存回答。请继续第 {context.current_question_index + 1} 个问题。",
+            "",
+            "",
+            *_empty_downloads(),
+        )
+    return retry_finalize(context.session_id, success_msg="已保存全部确认事实并生成投递包。")
 
 
 def build_app() -> gr.Blocks:
@@ -213,6 +314,7 @@ def build_app() -> gr.Blocks:
                 jd_text = gr.Textbox(label="粘贴一份 JD", lines=18, placeholder="粘贴完整岗位描述与任职要求…")
                 start_button = gr.Button("开始证据分析", variant="primary")
                 status = gr.Markdown()
+                retry_button = gr.Button("重试生成投递包", visible=False)
         with gr.Group(visible=False) as question_group:
             gr.Markdown("<span class='section-label'>03 / 事实确认</span>")
             question_md = gr.Markdown()
@@ -225,9 +327,22 @@ def build_app() -> gr.Blocks:
             report_download = gr.DownloadButton("下载完整报告", visible=False)
             zip_download = gr.DownloadButton("下载 Overleaf ZIP", visible=False, variant="primary")
             pdf_download = gr.DownloadButton("下载编译 PDF", visible=False)
-        outputs = [session, question_md, question_group, status, result_md, warning_md, report_download, zip_download, pdf_download]
+        outputs = [
+            session,
+            question_md,
+            question_group,
+            answer_text,
+            retry_button,
+            status,
+            result_md,
+            warning_md,
+            report_download,
+            zip_download,
+            pdf_download,
+        ]
         start_button.click(start_analysis, [latex_zip, resume_pdf, jd_text, github_enabled], outputs)
         answer_button.click(submit_answer, [session, answer_text], outputs)
+        retry_button.click(retry_finalize, [session], outputs)
     return demo
 
 

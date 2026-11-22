@@ -24,6 +24,7 @@ class Settings:
     model: str
     max_input_chars: int
     xelatex_path: str
+    llm_timeout: float = 120.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -36,6 +37,7 @@ class Settings:
         if not api_key or not model:
             raise ConfigError("请在 .env 中填写 LLM_API_KEY 和 LLM_MODEL，密钥不会在页面显示。")
         max_chars = int(os.getenv("MAX_INPUT_CHARS", "180000"))
+        llm_timeout = float(os.getenv("LLM_TIMEOUT", "120"))
         return cls(
             protocol=protocol,
             api_key=api_key,
@@ -43,19 +45,24 @@ class Settings:
             model=model,
             max_input_chars=max_chars,
             xelatex_path=find_xelatex(),
+            llm_timeout=llm_timeout,
         )
 
 
 def find_xelatex() -> str:
     configured = os.getenv("XELATEX_PATH", "").strip()
+    local_app_data = os.getenv("LOCALAPPDATA", "").strip()
     candidates = [configured] if configured else []
     candidates.extend(
         [
             shutil.which("xelatex") or "",
-            r"D:\\Program Files (x86)\\LaTex\\MiKTeX\\miktex\\bin\\x64\\xelatex.exe",
-            r"C:\\Program Files\\MiKTeX\\miktex\\bin\\x64\\xelatex.exe",
+            r"D:\Program\miktex\bin\x64\xelatex.exe",
+            r"D:\Program Files (x86)\LaTex\MiKTeX\miktex\bin\x64\xelatex.exe",
+            r"C:\Program Files\MiKTeX\miktex\bin\x64\xelatex.exe",
         ]
     )
+    if local_app_data:
+        candidates.append(str(Path(local_app_data) / "Programs" / "MiKTeX" / "miktex" / "bin" / "x64" / "xelatex.exe"))
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return candidate

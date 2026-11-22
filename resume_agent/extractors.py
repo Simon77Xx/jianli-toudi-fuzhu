@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import os
 import re
 import shutil
 import zipfile
@@ -124,12 +126,132 @@ def extract_pdf_text(pdf_path: str | Path) -> str:
     return text
 
 
+_BLOCK_START_RE = re.compile(r"\\(?:item\b|experience\b|education\b|begin\{abstract\})")
+_BLOCK_STOP_RE = re.compile(
+    r"\\(?:end\{(?:abstract|itemize|enumerate|educations|experiences|document)\}"
+    r"|begin\{(?:itemize|enumerate|educations|experiences)\}"
+    r"|sectionTitle\b|cvsection\b|section\*?\b|separator\b)"
+)
+
+
+def _strip_latex_comment(line: str) -> str:
+    return re.sub(r"(?<!\\)%.*$", "", line).strip()
+
+
+def _extract_tex_evidence_blocks(tex_text: str) -> list[tuple[int, int, str]]:
+    """Extract multi-line LaTeX resume blocks (abstract, education, experience, items)."""
+    lines = tex_text.splitlines()
+    start_idx = 0
+    end_idx = len(lines)
+    for idx, raw in enumerate(lines):
+        if "\\begin{document}" in raw:
+            start_idx = idx + 1
+            break
+    for idx in range(start_idx, len(lines)):
+        if "\\end{document}" in lines[idx]:
+            end_idx = idx
+            break
+
+    blocks: list[tuple[int, int, str]] = []
+    current_parts: list[str] = []
+    current_start = 0
+    current_end = 0
+    in_abstract = False
+
+    def flush() -> None:
+        nonlocal current_parts, current_start, current_end
+        if not current_parts:
+            return
+        text = re.sub(r"\s+", " ", " ".join(current_parts)).strip()
+        if text and text not in {"\\begin{abstract}", "\\end{abstract}"}:
+            blocks.append((current_start, current_end, text))
+        current_parts = []
+        current_start = 0
+        current_end = 0
+
+    for line_no in range(start_idx + 1, end_idx + 1):
+        cleaned = _strip_latex_comment(lines[line_no - 1])
+        if not cleaned:
+            continue
+
+        if "\\begin{abstract}" in cleaned:
+            flush()
+            in_abstract = True
+            remainder = cleaned.split("\\begin{abstract}", 1)[1]
+            if "\\end{abstract}" in remainder:
+                body = remainder.split("\\end{abstract}", 1)[0].strip()
+                if body:
+                    blocks.append((line_no, line_no, body))
+                in_abstract = False
+            else:
+                current_start = line_no
+                current_end = line_no
+                if remainder.strip():
+                    current_parts.append(remainder.strip())
+            continue
+
+        if in_abstract:
+            if "\\end{abstract}" in cleaned:
+                before = cleaned.split("\\end{abstract}", 1)[0].strip()
+                if before:
+                    if not current_start:
+                        current_start = line_no
+                    current_end = line_no
+                    current_parts.append(before)
+                flush()
+                in_abstract = False
+            else:
+                if not current_start:
+                    current_start = line_no
+                current_end = line_no
+                current_parts.append(cleaned)
+            continue
+
+        # Handle lines containing multiple \item commands (e.g. two bullets on one line).
+        if "\\item" in cleaned:
+            segments = [seg.strip() for seg in re.split(r"(?=\\item\b)", cleaned) if seg.strip()]
+            for seg in segments:
+                if seg.startswith("\\item"):
+                    flush()
+                    current_start = line_no
+                    current_end = line_no
+                    current_parts = [seg]
+                elif current_parts:
+                    current_end = line_no
+                    current_parts.append(seg)
+            continue
+
+        if _BLOCK_START_RE.search(cleaned):
+            flush()
+            current_start = line_no
+            current_end = line_no
+            current_parts = [cleaned]
+            continue
+
+        if _BLOCK_STOP_RE.search(cleaned):
+            flush()
+            continue
+
+        if current_parts:
+            current_end = line_no
+            current_parts.append(cleaned)
+
+    flush()
+    return blocks
+
+
 def evidence_from_materials(tex_text: str, pdf_text: str, confirmed_facts: list[dict[str, str]]) -> list[Evidence]:
     evidence: list[Evidence] = []
-    for index, line in enumerate(tex_text.splitlines(), start=1):
-        compact = line.strip()
-        if compact and ("\\item" in compact or "\\experience" in compact or "\\education" in compact):
-            evidence.append(Evidence(id=f"R{len(evidence) + 1}", source="latex", claim=compact[:800], location=f"LaTeX 第 {index} 行"))
+    for start_line, end_line, claim in _extract_tex_evidence_blocks(tex_text):
+        location = f"LaTeX 第 {start_line} 行" if start_line == end_line else f"LaTeX 第 {start_line}-{end_line} 行"
+        evidence.append(Evidence(id=f"R{len(evidence) + 1}", source="latex", claim=claim[:800], location=location))
+    if not evidence and pdf_text.strip():
+        for index, para in enumerate(
+            (line.strip() for line in pdf_text.splitlines() if len(line.strip()) >= 8), start=1
+        ):
+            evidence.append(Evidence(id=f"R{len(evidence) + 1}", source="pdf", claim=para[:800], location=f"PDF 第 {index} 段"))
+            if len(evidence) >= 40:
+                break
     for fact in confirmed_facts:
         evidence.append(
             Evidence(
@@ -147,17 +269,35 @@ def evidence_from_materials(tex_text: str, pdf_text: str, confirmed_facts: list[
 def github_repositories(tex_text: str) -> list[tuple[str, str]]:
     repositories: list[tuple[str, str]] = []
     for owner, repo in GITHUB_RE.findall(tex_text):
-        repo = repo.rstrip(".git")
+        repo = re.sub(r"\.git$", "", repo, flags=re.I).rstrip(".")
+        if not repo:
+            continue
         item = (owner, repo)
         if item not in repositories:
             repositories.append(item)
     return repositories
 
 
+def _decode_github_readme(response: requests.Response, max_chars: int = 400) -> str:
+    try:
+        data = response.json()
+        encoded = data.get("content", "")
+        if not encoded:
+            return ""
+        raw = base64.b64decode(encoded).decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    compact = re.sub(r"\s+", " ", raw).strip()
+    return compact[:max_chars]
+
+
 def inspect_public_github(tex_text: str) -> tuple[list[Evidence], list[str]]:
     evidence: list[Evidence] = []
     notes: list[str] = []
     headers = {"Accept": "application/vnd.github+json", "User-Agent": "local-resume-agent"}
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     for owner, repo in github_repositories(tex_text):
         url = f"https://api.github.com/repos/{owner}/{repo}"
         label = f"{owner}/{repo}"
@@ -171,9 +311,12 @@ def inspect_public_github(tex_text: str) -> tuple[list[Evidence], list[str]]:
             readme_ok = readme.status_code == 200
             has_code = payload.get("size", 0) > 0
             description = payload.get("description") or "无仓库简介"
+            language = payload.get("language") or "未知语言"
             if readme_ok and has_code:
-                claim = f"公开仓库 {label}：{description}；README 可访问，仓库包含内容。"
-                evidence.append(Evidence(id=f"G{len(evidence) + 1}", source="github", claim=claim, location=url))
+                readme_excerpt = _decode_github_readme(readme)
+                excerpt_part = f"；README 摘要：{readme_excerpt}" if readme_excerpt else "；README 可访问"
+                claim = f"公开仓库 {label}（主语言：{language}）：{description}{excerpt_part}"
+                evidence.append(Evidence(id=f"G{len(evidence) + 1}", source="github", claim=claim[:800], location=url))
                 notes.append(f"GitHub 可信度门禁通过：{label}（README 与仓库内容均可访问）。")
             else:
                 missing = "README" if not readme_ok else "可识别的仓库内容"

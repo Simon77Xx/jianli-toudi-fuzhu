@@ -18,9 +18,25 @@ from .extractors import (
     pdf_tex_consistency_warning,
     safe_extract_zip,
 )
-from .latex import compile_latex, compact_to_two_pages, copy_compiled_pdf, create_tailored_project, make_overleaf_zip
+from .latex import (
+    compact_to_two_pages,
+    compile_latex,
+    copy_compiled_pdf,
+    create_tailored_project,
+    extract_numbers,
+    make_overleaf_zip,
+)
 from .llm import ModelServiceError, require_configured_gateway
-from .models import BaselineAnalysis, Evidence, FinalAnalysis, InitialAnalysis, JobContext, Question, format_score_delta
+from .models import (
+    BaselineAnalysis,
+    Evidence,
+    FinalAnalysis,
+    InitialAnalysis,
+    JobContext,
+    Question,
+    format_score_delta,
+    recommendation_label,
+)
 from .storage import load_facts, save_confirmed_fact
 
 
@@ -148,6 +164,8 @@ class ResumePipeline:
         path.write_text(context.model_dump_json(ensure_ascii=False, indent=2), encoding="utf-8")
 
     def load_context(self, session_id: str) -> JobContext:
+        if not session_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", session_id):
+            raise PipelineError("当前会话已失效，请重新上传材料。")
         path = self.runtime_root / session_id / "session.json"
         if not path.exists():
             raise PipelineError("当前会话已失效，请重新上传材料。")
@@ -160,7 +178,7 @@ class ResumePipeline:
         work_dir = self.runtime_root / session_id
         source_dir = work_dir / "source"
         try:
-            files = safe_extract_zip(latex_zip, source_dir)
+            safe_extract_zip(latex_zip, source_dir)
             tex_path = find_main_tex(source_dir)
             target_pdf = work_dir / "input-resume.pdf"
             work_dir.mkdir(parents=True, exist_ok=True)
@@ -195,7 +213,7 @@ class ResumePipeline:
             github_notes=notes,
         )
         self._ensure_request_size(context)
-        gateway = require_configured_gateway()
+        gateway = require_configured_gateway(self.settings)
         context.initial = gateway.structured(SYSTEM_PROMPT, _initial_prompt(context), InitialAnalysis)
         self._save_context(context)
         question = context.initial.questions[0] if context.initial.questions else None
@@ -226,7 +244,7 @@ class ResumePipeline:
         if context.initial and context.current_question_index < len(context.initial.questions):
             raise PipelineError("请先完成当前追问，或逐题回答“暂无”。")
         self._ensure_request_size(context)
-        gateway = require_configured_gateway()
+        gateway = require_configured_gateway(self.settings)
         settings = self.settings or Settings.from_env()
         baseline = gateway.structured(SYSTEM_PROMPT, _baseline_prompt(context), BaselineAnalysis)
         baseline_compile = compile_latex(settings.xelatex_path, Path(context.tex_path))
@@ -234,12 +252,18 @@ class ResumePipeline:
         analysis = gateway.structured(SYSTEM_PROMPT, _final_prompt(context), FinalAnalysis)
         analysis, guard_warnings = self._apply_model_guards(context, analysis)
         valid_evidence = {item.id for item in context.evidence}
+        evidence_by_id = {item.id: item.claim for item in context.evidence}
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         output_dir = self.output_root / f"{_slug(context.jd_text.splitlines()[0])}-{timestamp}"
         target_project = output_dir / "project"
         output_dir.mkdir(parents=True, exist_ok=True)
         target_tex, actions, rejected = create_tailored_project(
-            Path(context.project_dir), Path(context.tex_path), target_project, analysis, valid_evidence
+            Path(context.project_dir),
+            Path(context.tex_path),
+            target_project,
+            analysis,
+            valid_evidence,
+            evidence_by_id=evidence_by_id,
         )
         rejected.extend(guard_warnings)
         compile_result = compact_to_two_pages(settings.xelatex_path, target_tex)
@@ -306,10 +330,10 @@ class ResumePipeline:
         """Reject high-risk model output before it can reach the editable resume."""
         warnings: list[str] = []
         reference = "\n".join(
-            [context.tex_text, context.pdf_text, _evidence_text(context.evidence), *context.answers.values()]
+            [context.tex_text, context.pdf_text, *(item.claim for item in context.evidence), *context.answers.values()]
         )
-        source_numbers = set(re.findall(r"\d+(?:\.\d+)?%?", reference))
-        summary_numbers = set(re.findall(r"\d+(?:\.\d+)?%?", analysis.tailored_summary))
+        source_numbers = extract_numbers(reference)
+        summary_numbers = extract_numbers(analysis.tailored_summary)
         if not summary_numbers.issubset(source_numbers):
             analysis.tailored_summary = ""
             warnings.append("拒绝个人摘要改写：包含原始材料和已确认事实中不存在的新数字。")
@@ -317,7 +341,9 @@ class ResumePipeline:
         valid_ids = {item.id for item in context.evidence}
         safe_records = []
         for record in analysis.defense_records:
-            if set(record.source_evidence_ids).issubset(valid_ids):
+            if not record.source_evidence_ids:
+                warnings.append("过滤一条面试可辩护记录：未提供证据 ID。")
+            elif set(record.source_evidence_ids).issubset(valid_ids):
                 safe_records.append(record)
             else:
                 warnings.append(
@@ -328,13 +354,7 @@ class ResumePipeline:
 
     @staticmethod
     def _recommendation(score: int) -> str:
-        if score < 50:
-            return "低优先级/不建议投递"
-        if score < 70:
-            return "可尝试"
-        if score < 85:
-            return "较匹配"
-        return "强匹配"
+        return recommendation_label(score)
 
     def _render_report(
         self,
@@ -396,7 +416,8 @@ class ResumePipeline:
         if compile_result.success:
             lines.append(f"- 编译成功，页数：{compile_result.page_count}。")
         else:
-            lines.append("- 编译失败；请查看日志摘要并修复后再投递。")
+            excerpt = compile_result.log_excerpt[-1500:].strip()
+            lines.append(f"- 编译失败；请查看日志摘要并修复后再投递：{excerpt}" if excerpt else "- 编译失败；请查看日志摘要并修复后再投递。")
         lines.extend(f"- 自动压缩：{item}" for item in compile_result.compression_actions)
         lines.extend(f"- 修改前质量约束：{item}" for item in baseline_warnings)
         if baseline_compile.success:

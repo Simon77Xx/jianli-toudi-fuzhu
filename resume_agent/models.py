@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Evidence(BaseModel):
@@ -31,19 +31,24 @@ class Question(BaseModel):
 class InitialAnalysis(BaseModel):
     quick_assessment: str
     requirements: list[Requirement]
-    questions: list[Question] = Field(default_factory=list, max_length=5)
+    questions: list[Question] = Field(default_factory=list)
+
+    @field_validator("questions")
+    @classmethod
+    def _cap_questions(cls, value: list[Question]) -> list[Question]:
+        return value[:5]
 
 
 class TexEdit(BaseModel):
     source: str
     target: str
     reason: str
-    evidence_ids: list[str] = Field(min_length=1)
+    evidence_ids: list[str] = Field(default_factory=list)
 
 
 class DefenseRecord(BaseModel):
     rewritten_text: str
-    source_evidence_ids: list[str] = Field(min_length=1)
+    source_evidence_ids: list[str] = Field(default_factory=list)
     rewrite_reason: str
     possible_question: str
     truthful_answer_outline: str
@@ -109,3 +114,14 @@ def format_score_delta(before: int, after: int) -> str:
     if delta > 0:
         return f"+{delta}"
     return str(delta)
+
+
+def recommendation_label(score: int) -> str:
+    """Map competitiveness score to a consistent delivery recommendation label."""
+    if score < 50:
+        return "低优先级/不建议投递"
+    if score < 70:
+        return "可尝试"
+    if score < 85:
+        return "较匹配"
+    return "强匹配"
